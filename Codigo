@@ -1,0 +1,216 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.tri as tri
+from shapely.geometry import Polygon
+from shapely.strtree import STRtree
+from shapely.geometry import Point
+from scipy.interpolate import LinearNDInterpolator
+import geopandas as gpd
+import ezdxf
+import time
+
+def cargar_mapa_calor(filepath):
+    df = pd.read_excel(filepath, engine="openpyxl")
+    df.columns = [c.lower().strip() for c in df.columns]
+    df = df.rename(columns={"position x": "x", "position y": "y", "contents": "z"})
+    df = df[["x", "y", "z"]].dropna()
+    df = df.apply(pd.to_numeric, errors="coerce").dropna()
+    return df
+
+def cargar_terreno(filepath):
+    df = pd.read_csv(filepath, usecols=[0,1,2], names=["este", "norte", "cota"], header=None)
+    df = df.apply(pd.to_numeric, errors="coerce").dropna()
+    return df
+
+def generar_isolineas(x, y, z):
+    triang = tri.Triangulation(x, y)
+    fig, ax = plt.subplots(figsize=(10, 10))
+    levels = np.arange(np.floor(z.min()), np.ceil(z.max()) + 0.1, 0.1)
+    cs = ax.tricontour(triang, z, levels=levels)
+    ax.set_title("Isolíneas del mapa de calor")
+    ax.set_aspect("equal")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.grid(True)
+    plt.colorbar(cs, ax=ax, label="Variación Z (corte/lleno)")
+    plt.tight_layout()
+    plt.savefig("isolíneas_mapa_de_calor.png", dpi=300)
+    plt.close()
+    print("📷 Imagen de isolíneas guardada como 'isolíneas_mapa_de_calor.png'")
+    return cs, triang
+
+def extraer_contornos(cs):
+    contours_data = []
+    for i, segs in enumerate(cs.allsegs):
+        level = cs.levels[i]
+        classification = "corte" if level < 0 else "lleno"
+        for seg in segs:
+            if len(seg) < 3:
+                continue
+            if not np.array_equal(seg[0], seg[-1]):
+                seg = np.vstack([seg, seg[0]])
+            try:
+                poly = Polygon(seg)
+                if not poly.is_valid or poly.area < 0.01:
+                    continue
+                centroid = poly.centroid
+                contours_data.append({
+                    "level": level,
+                    "classification": classification,
+                    "geometry": poly,
+                    "centroid_x": centroid.x,
+                    "centroid_y": centroid.y
+                })
+            except Exception as e:
+                print(f"⚠️ Omitiendo segmento inválido: {e}")
+    return contours_data
+
+def agrupar_contornos(gdf):
+    gdf = gdf.sort_values(by="geometry", key=lambda geom: geom.apply(lambda g: g.area), ascending=False).reset_index(drop=True)
+    tree = STRtree(gdf.geometry.values)
+    print("🔄 Agrupando contornos concéntricos...")
+    group_id = 0
+    asignados = set()
+    for idx, row in gdf.iterrows():
+        if idx in asignados:
+            continue
+        grupo_actual = [idx]
+        geom_externa = row.geometry
+        for jdx in tree.query(geom_externa):
+            if jdx == idx or jdx in asignados:
+                continue
+            if geom_externa.contains(gdf.geometry.iloc[jdx]):
+                grupo_actual.append(jdx)
+                asignados.add(jdx)
+        for miembro in grupo_actual:
+            gdf.loc[miembro, "grupo"] = group_id
+        group_id += 1
+    return gdf
+
+def filtrar_contornos_significativos(gdf, df):
+    print("🔎 Filtrando zonas sin variaciones significativas (|z| > 0.1)...")
+    start = time.time()
+    df_sig = df[(df["z"] > 0.1) | (df["z"] < -0.1)].copy()
+    gdf_puntos_sig = gpd.GeoDataFrame(
+        df_sig,
+        geometry=gpd.points_from_xy(df_sig["x"], df_sig["y"]),
+        crs="EPSG:3116"
+    )
+    print(f"✅ Puntos significativos: {len(gdf_puntos_sig)}")
+    sindex = gdf_puntos_sig.sindex
+
+    def contiene_significativos(polygon):
+        posibles = list(sindex.intersection(polygon.bounds))
+        candidatos = gdf_puntos_sig.iloc[posibles]
+        return candidatos[candidatos.intersects(polygon)].shape[0] > 0
+
+    gdf["valido"] = gdf["geometry"].apply(contiene_significativos)
+    gdf = gdf[gdf["valido"]].drop(columns="valido").reset_index(drop=True)
+    print(f"✅ Contornos válidos finales: {len(gdf)}")
+    print(f"⏱️ Filtrado completado en {time.time() - start:.2f} s")
+    return gdf
+
+def filtrar_triangulos_por_contorno(triang, x, y, gdf):
+    polygons = gdf["geometry"].values
+    tri_indices_filtrados = []
+    for tri_indices in triang.triangles:
+        puntos = [(x[i], y[i]) for i in tri_indices]
+        centroide = Polygon(puntos).centroid
+        if any(poly.contains(centroide) for poly in polygons):
+            tri_indices_filtrados.append(tri_indices)
+    return np.array(tri_indices_filtrados)
+
+def simplificar_contorno(coords, tolerancia=0.5):
+    from shapely.geometry import LineString
+    linea = LineString(coords)
+    simplificada = linea.simplify(tolerancia, preserve_topology=True)
+    if simplificada.is_ring:
+        return list(simplificada.coords)
+    else:
+        return list(LineString(simplificada.coords).buffer(0.01).exterior.coords)
+
+def exportar_resultados(gdf, df, x, y, z, triang, interp_terreno):
+    fig, ax = plt.subplots(figsize=(10, 10))
+    gdf.boundary.plot(ax=ax, linewidth=1, color="black")
+    gdf.plot(ax=ax, column="grupo", legend=True, cmap="tab20", alpha=0.4)
+    gdf_exterior = gdf.sort_values(by="geometry", key=lambda geom: geom.apply(lambda g: g.area), ascending=False).drop_duplicates("grupo").reset_index(drop=True)
+    for idx, row in gdf_exterior.iterrows():
+        cx, cy = row["centroid_x"], row["centroid_y"]
+        ax.text(cx, cy, str(idx), fontsize=8, ha="center", va="center", color="red")
+    plt.title("Contornos Agrupados por Núcleo")
+    plt.savefig("contornos_numerados.png")
+    plt.close()
+
+    registros = []
+    for idx, row in gdf_exterior.iterrows():
+        clas = row["classification"]
+        area = row.geometry.area
+        volumen = area * abs(row["level"])
+
+        coords_simplificados = simplificar_contorno(row.geometry.exterior.coords, tolerancia=0.5)
+
+        for i, (xv, yv) in enumerate(coords_simplificados):
+            registros.append({
+                "grupo": idx,
+                "tipo": clas,
+                "area_m2": area,
+                "volumen_m3": volumen,
+                "vertex_id": i + 1,
+                "x": xv,
+                "y": yv
+            })
+    pd.DataFrame(registros).to_excel("vertices_contornos_exteriores.xlsx", index=False)
+
+    doc = ezdxf.new()
+    msp = doc.modelspace()
+    doc.layers.add("TIN", color=5)
+
+    for _, row in gdf.iterrows():
+        coords_2d = list(row.geometry.exterior.coords)
+        coords_3d = []
+        for x_pt, y_pt in coords_2d:
+            z_base = interp_terreno(x_pt, y_pt)
+            if np.isnan(z_base):
+                continue
+            z_final = z_base + float(row["level"])
+            coords_3d.append((x_pt, y_pt, z_final))
+        if len(coords_3d) >= 3:
+            msp.add_polyline3d(coords_3d, dxfattribs={
+                "layer": row["classification"],
+                "color": 1 if row["classification"] == "corte" else 3
+            })
+        cx, cy = row["centroid_x"], row["centroid_y"]
+        zc_base = interp_terreno(cx, cy)
+        if not np.isnan(zc_base):
+            zc_final = zc_base + float(row["level"])
+            msp.add_point((cx, cy, zc_final), dxfattribs={
+                "layer": f"{row['classification']}_centroid",
+                "color": 2
+            })
+
+    print("⛏️ Exportando malla TIN como 3DFACE...")
+    triang_filtered = filtrar_triangulos_por_contorno(triang, x, y, gdf)
+    for tri_indices in triang_filtered:
+        pts = [(x[idx], y[idx], z[idx]) for idx in tri_indices]
+        if len(pts) == 3:
+            pts.append(pts[2])
+            face = msp.add_3dface(pts)
+            face.dxf.layer = "TIN"
+            face.dxf.color = 5
+
+    doc.saveas("contornos_elevados.dxf")
+    print("✅ DXF generado con elevación real: contornos_elevados.dxf")
+
+if __name__ == "__main__":
+    df = cargar_mapa_calor("MAPA DE CALOR.xlsx")
+    x, y, z = df["x"].values, df["y"].values, df["z"].values
+    df_terreno = cargar_terreno("Levantamiento.csv")
+    xt, yt, zt = df_terreno["este"].values, df_terreno["norte"].values, df_terreno["cota"].values
+    interp_terreno = LinearNDInterpolator(list(zip(xt, yt)), zt)
+    cs, triang = generar_isolineas(x, y, z)
+    contours_data = extraer_contornos(cs)
+    gdf = gpd.GeoDataFrame(contours_data, crs="EPSG:3116")
+    gdf = agrupar_contornos(gdf)
+    gdf = filtrar_contornos_significativos(gdf, df)
+    exportar_resultados(gdf, df, x, y, z, triang, interp_terreno)
